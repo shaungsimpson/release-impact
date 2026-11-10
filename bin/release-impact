@@ -1,0 +1,115 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+use ReleaseImpact\Analyser;
+use ReleaseImpact\Failure;
+use ReleaseImpact\Git;
+use ReleaseImpact\Redactor;
+use ReleaseImpact\Renderer;
+
+const VERSION = '0.1.0';
+const USAGE = <<<'TXT'
+Release Impact: report deployment-relevant changes between two Git revisions of a Laravel app.
+
+Usage:
+  release-impact compare <base> <head> [--repo=<path>] [--format=text|json]
+
+Options:
+  --repo=<path>     Repository to analyse (default: current directory)
+  --format=<fmt>    text (default) or json (schema_version 1, see README)
+  -h, --help        Show this help
+  -V, --version     Show the version
+
+Exit codes:
+  0  Report produced (findings and limitations do not change the exit code)
+  1  Internal error, or dependencies are not installed
+  2  Usage error
+  3  Repository path is not a Git repository, or a revision does not resolve to a commit
+  4  Git could not be run or failed
+
+TXT;
+
+// Installed as a Composer dependency (global, CPX) the autoloader sits further up the tree.
+foreach ([__DIR__ . '/../vendor/autoload.php', __DIR__ . '/../../../autoload.php'] as $autoload) {
+    if (is_file($autoload)) {
+        require $autoload;
+        break;
+    }
+}
+
+if (!class_exists(Analyser::class)) {
+    fwrite(STDERR, "Dependencies are not installed. Run composer install.\n");
+    exit(1);
+}
+
+$redactor = new Redactor();
+
+// PHP notices could quote data; route them through the redacting error output below.
+set_error_handler(function (int $severity, string $message, string $file, int $line): bool {
+    if (!(error_reporting() & $severity)) {
+        return false;
+    }
+    throw new ErrorException($message, 0, $severity, $file, $line);
+});
+
+try {
+    $options = ['repo' => getcwd(), 'format' => 'text'];
+    $positional = [];
+    $args = array_slice($argv, 1);
+
+    while ($args !== []) {
+        $arg = array_shift($args);
+
+        if ($arg === '-h' || $arg === '--help') {
+            echo USAGE;
+            exit(0);
+        } elseif ($arg === '-V' || $arg === '--version') {
+            echo 'release-impact ' . VERSION . "\n";
+            exit(0);
+        } elseif ($arg === '--') {
+            array_push($positional, ...$args);
+            break;
+        } elseif (preg_match('/^--(repo|format)(?:=(.*))?$/s', $arg, $match)) {
+            $value = $match[2] ?? array_shift($args);
+            if ($value === null || $value === '') {
+                throw new Failure("Option --{$match[1]} requires a value.", Failure::USAGE);
+            }
+            $options[$match[1]] = $value;
+        } elseif (str_starts_with($arg, '-') && $arg !== '-') {
+            throw new Failure("Unknown option: {$arg}", Failure::USAGE);
+        } else {
+            $positional[] = $arg;
+        }
+    }
+
+    if ($positional === []) {
+        echo USAGE;
+        exit(0);
+    }
+
+    if ($positional[0] !== 'compare' || count($positional) !== 3) {
+        throw new Failure('Expected: compare <base> <head>', Failure::USAGE);
+    }
+
+    if (!in_array($options['format'], ['text', 'json'], true)) {
+        throw new Failure("Unknown format: {$options['format']} (expected text or json)", Failure::USAGE);
+    }
+
+    $git = new Git($options['repo']);
+    $git->assertRepository();
+    $report = $redactor->report((new Analyser($git))->analyse($positional[1], $positional[2]));
+
+    echo $options['format'] === 'json' ? Renderer::json($report) : Renderer::text($report);
+    exit(0);
+} catch (Failure $e) {
+    fwrite(STDERR, 'release-impact: ' . $redactor->text($e->getMessage()) . "\n");
+    if ($e->getCode() === Failure::USAGE) {
+        fwrite(STDERR, "Run release-impact --help for usage.\n");
+    }
+    exit($e->getCode());
+} catch (Throwable $e) {
+    fwrite(STDERR, 'release-impact: internal error: ' . $redactor->text($e->getMessage()) . "\n");
+    exit(1);
+}
